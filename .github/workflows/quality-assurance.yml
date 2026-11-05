@@ -207,6 +207,7 @@ jobs:
           severity: 'HIGH,CRITICAL'
           ignore-unfixed: true
           exit-code: '1'
+          version: 'v0.76.2'
 
   # ===========================================================================
   # Security scanning
@@ -242,8 +243,13 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'HIGH,CRITICAL'
+          # Without it the SARIF report holds every severity and exit-code
+          # fails on informational findings without fix (GO-2026-5932,
+          # x/crypto/openpgp, not built in)
+          limit-severities-for-sarif: true
           ignore-unfixed: true
           exit-code: '1'
+          version: 'v0.76.2'
 
       - name: Upload Trivy results
         # no artifact/code scanning API when run locally with act
