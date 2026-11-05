@@ -1,0 +1,156 @@
+# Plain manifests for clusters without the vaultwarden-helm chart (which ships
+# the exporter, the read-only PostgreSQL role and its grants).
+#
+#   kubectl -n vaultwarden create secret generic vaultwarden-exporter-db \
+#     --from-literal=url='postgresql://vw_exporter:CHANGE_ME@vaultwarden-db-rw:5432/vaultwarden'
+#   kubectl -n vaultwarden apply -f vaultwarden-exporter.yaml
+#
+# One replica: the event stream must have a single reader (two replicas would
+# print every event twice). The cursor is kept in the ConfigMap
+# vaultwarden-exporter-state, created by the exporter itself.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vaultwarden-exporter
+  labels:
+    app.kubernetes.io/name: vaultwarden-exporter
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vaultwarden-exporter
+  labels:
+    app.kubernetes.io/name: vaultwarden-exporter
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [vaultwarden-exporter-state]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vaultwarden-exporter
+  labels:
+    app.kubernetes.io/name: vaultwarden-exporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vaultwarden-exporter
+subjects:
+  - kind: ServiceAccount
+    name: vaultwarden-exporter
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vaultwarden-exporter
+  labels:
+    app.kubernetes.io/name: vaultwarden-exporter
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vaultwarden-exporter
+    spec:
+      serviceAccountName: vaultwarden-exporter
+      # Token used only to save the cursor ConfigMap (the Role is limited to it)
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: exporter
+          image: ghcr.io/maximewewer/vaultwarden-exporter:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: VAULTWARDEN_EXPORTER_DATABASE_URL_FILE
+              value: /etc/vaultwarden-exporter/db/url
+            - name: VAULTWARDEN_EXPORTER_EVENTS_ENABLED
+              value: "true"
+            - name: VAULTWARDEN_EXPORTER_EVENTS_STATE_BACKEND
+              value: kubernetes
+          ports:
+            - name: metrics
+              containerPort: 9776
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: db
+              mountPath: /etc/vaultwarden-exporter/db
+              readOnly: true
+      volumes:
+        - name: db
+          secret:
+            secretName: vaultwarden-exporter-db
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vaultwarden-exporter
+  labels:
+    app.kubernetes.io/name: vaultwarden-exporter
+spec:
+  selector:
+    app.kubernetes.io/name: vaultwarden-exporter
+  ports:
+    - name: metrics
+      port: 9776
+      targetPort: metrics
+---
+# Requires the prometheus-operator CRDs. Add the label your Prometheus selects
+# ServiceMonitors with (kube-prometheus-stack: release: <release name>).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vaultwarden-exporter
+  labels:
+    app.kubernetes.io/name: vaultwarden-exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-exporter
+  endpoints:
+    - port: metrics
+      interval: 60s

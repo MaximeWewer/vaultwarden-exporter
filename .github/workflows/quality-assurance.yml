@@ -1,0 +1,253 @@
+name: Quality Assurance
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+  # Called by the release workflow: nothing is published without QA
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  GOLANGCI_LINT_VERSION: 'v2.14.0'
+  GOVULNCHECK_VERSION: 'v1.9.0'
+  KUBECONFORM_VERSION: 'v0.6.7'
+  KUBECONFORM_SHA256: '95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73'
+  PROMETHEUS_VERSION: '3.5.0'
+  PROMETHEUS_SHA256: 'e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a'
+
+jobs:
+  # ===========================================================================
+  # Formatting, modules and linters (golangci-lint runs staticcheck, errcheck,
+  # ineffassign, gosec... see .golangci.yml)
+  # ===========================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-environment
+
+      - name: Verify Go modules
+        run: |
+          go mod verify
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -s -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Files not formatted (run gofmt -s -w .):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m
+
+  # ===========================================================================
+  # Deployment assets: Kubernetes manifests against the schemas, alerting
+  # rules, compose file, dashboard, metric names
+  # (.github/scripts/check-deployments.sh)
+  # ===========================================================================
+  deployments:
+    name: Deployments
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install kubeconform and promtool
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cd "$(mktemp -d)"
+          curl -sSfLO "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform-linux-amd64.tar.gz" | sha256sum -c -
+          tar xzf kubeconform-linux-amd64.tar.gz -C "$HOME/.local/bin" kubeconform
+          archive="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl -sSfLO "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${archive}"
+          echo "${PROMETHEUS_SHA256}  ${archive}" | sha256sum -c -
+          tar xzf "$archive" --strip-components=1 -C "$HOME/.local/bin" "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check deployment assets
+        run: .github/scripts/check-deployments.sh
+
+      # Event and device type names against the Vaultwarden sources
+      - name: Check enums against Vaultwarden
+        run: .github/scripts/check-enums.sh
+
+  # ===========================================================================
+  # Unit tests (no network access required)
+  # ===========================================================================
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-environment
+
+      - name: Run tests with race detector and coverage
+        run: go test -race -covermode=atomic -coverprofile=coverage.out -timeout=5m ./...
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/^total:/ {sub("%", "", $3); print $3}')
+          echo "Total coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 70" | bc -l) )); then
+            echo "Coverage ${COVERAGE}% is below 70%"
+            exit 1
+          fi
+
+      - name: Upload coverage report
+        if: ${{ !env.ACT }} # no artifact/code scanning API when run locally with act
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 30
+
+  # ===========================================================================
+  # Integration: a real Vaultwarden creates the schema (its migrations) on each
+  # engine and produces the events through its API; the exporter reads them
+  # back (.github/scripts/integration.sh)
+  # ===========================================================================
+  integration:
+    name: Integration (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [postgresql, mysql, sqlite]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-environment
+
+      - name: Run against a real Vaultwarden
+        run: .github/scripts/integration.sh ${{ matrix.engine }}
+
+  # ===========================================================================
+  # Cross compilation, including 32-bit targets (pure Go drivers, no CGO)
+  # ===========================================================================
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('/v{0}', matrix.goarm) || '' }}
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: arm, goarm: '7' }
+          - { goos: linux, goarch: '386' }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-environment
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags="-s -w" -o /dev/null ./cmd/vaultwarden-exporter
+
+  # ===========================================================================
+  # Container image: build (not pushed) and scan
+  # ===========================================================================
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: docker build -t vaultwarden-exporter:qa .
+
+      - name: Check the image starts
+        run: docker run --rm vaultwarden-exporter:qa --version
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: 'vaultwarden-exporter:qa'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ===========================================================================
+  # Security scanning
+  # ===========================================================================
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-environment
+
+      # govulncheck fails on vulnerabilities reachable from the code. Advisories
+      # on modules whose vulnerable packages are not imported are informational:
+      # GO-2026-5932 (golang.org/x/crypto/openpgp, deprecated, no fix) comes from
+      # x/crypto, required by exporter-toolkit for bcrypt; openpgp is not built in.
+      - name: Check for known vulnerabilities
+        run: |
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          govulncheck ./...
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Upload Trivy results
+        # no artifact/code scanning API when run locally with act
+        if: ${{ !cancelled() && !env.ACT }}
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: 'trivy-results.sarif'

@@ -1,0 +1,61 @@
+# Vaultwarden (SQLite) with vaultwarden-exporter:
+#   docker compose -f deployments/docker/docker-compose.yml up -d
+#   curl localhost:9776/metrics            # Prometheus metrics
+#   docker compose logs -f exporter        # audit events (stdout, JSON lines)
+#
+# SQLite runs in WAL mode: a reader needs access to the db.sqlite3-shm file, so
+# both containers share the same non-root uid. With PostgreSQL / MySQL, point
+# DATABASE_URL at a read-only role instead (see the README for the GRANTs).
+services:
+  # Named volumes are created owned by root: hand them to the shared uid once
+  init-permissions:
+    image: alpine:3
+    command: ["chown", "-R", "1000:1000", "/data", "/state"]
+    volumes:
+      - vw-data:/data
+      - exporter-state:/state
+
+  vaultwarden:
+    image: vaultwarden/server:1.37.5-alpine
+    user: "1000:1000"
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+    environment:
+      DOMAIN: "http://localhost:8080"
+      ROCKET_PORT: "8080"
+      # Vaultwarden records audit events only when this is on
+      ORG_EVENTS_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - vw-data:/data
+    restart: unless-stopped
+
+  exporter:
+    image: ghcr.io/maximewewer/vaultwarden-exporter:latest
+    user: "1000:1000"
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+      vaultwarden:
+        condition: service_started
+    environment:
+      DATABASE_URL: "sqlite:///data/db.sqlite3"
+      VAULTWARDEN_EXPORTER_EVENTS_ENABLED: "true"
+      VAULTWARDEN_EXPORTER_EVENTS_STATE_PATH: "/state/state.json"
+    ports:
+      - "9776:9776"
+    volumes:
+      - vw-data:/data
+      - exporter-state:/state
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  vw-data:
+  exporter-state:

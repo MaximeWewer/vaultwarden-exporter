@@ -1,0 +1,21 @@
+name: 'Setup Go Environment'
+description: 'Setup Go (version read from go.mod) with module and build caching'
+inputs:
+  cache-dependency-path:
+    description: 'Path to go.sum for cache key'
+    required: false
+    default: 'go.sum'
+
+runs:
+  using: 'composite'
+  steps:
+  - name: Setup Go
+    uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+    with:
+      go-version-file: go.mod
+      cache: true
+      cache-dependency-path: ${{ inputs.cache-dependency-path }}
+
+  - name: Display Go version
+    shell: bash
+    run: go version

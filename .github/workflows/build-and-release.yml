@@ -1,0 +1,575 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        # Version pattern: YEAR.MONTH_INDEX.RELEASE_INDEX (e.g. 2026.6.3)
+        description: 'Force a specific version (optional, format: YYYY.M.X)'
+        required: false
+        type: string
+
+# Each job declares the permissions it needs
+permissions:
+  contents: read
+
+# One release at a time: the release index is computed from the existing tags
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/vaultwarden-exporter
+
+jobs:
+  # =============================================================================
+  # Job 0: Quality assurance - lint, tests, builds, image and security scans
+  # =============================================================================
+  qa:
+    name: Quality Assurance
+    uses: ./.github/workflows/quality-assurance.yml
+    permissions:
+      contents: read
+      security-events: write
+
+  # =============================================================================
+  # Job 1: Prepare Build - Extract version and validate
+  # =============================================================================
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    needs: qa
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.get_version.outputs.tag }}
+      is_prerelease: ${{ steps.get_version.outputs.is_prerelease }}
+      image_name_lower: ${{ steps.lowercase.outputs.image_name_lower }}
+      repository_owner_lower: ${{ steps.lowercase.outputs.repository_owner_lower }}
+      build_date: ${{ steps.build_date.outputs.build_date }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Convert names to lowercase
+        id: lowercase
+        run: |
+          IMAGE_NAME_LOWER=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+
+          echo "image_name_lower=${IMAGE_NAME_LOWER}" >> "$GITHUB_OUTPUT"
+          echo "repository_owner_lower=${OWNER_LOWER}" >> "$GITHUB_OUTPUT"
+
+          echo "Image name (lowercase): ${IMAGE_NAME_LOWER}"
+          echo "Repository owner (lowercase): ${OWNER_LOWER}"
+
+      - name: Generate version
+        id: get_version
+        env:
+          # Inputs go through the environment, never interpolated in the script
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_VERSION: ${{ github.event.inputs.force_version }}
+        # Version pattern: YEAR.MONTH_INDEX.RELEASE_INDEX (e.g. 2026.6.3), tag vVERSION
+        #   - tag push v*.*.*   -> version taken from the tag
+        #   - workflow_dispatch -> force_version, or the next index of the month
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] && [ "$GITHUB_REF" != "${GITHUB_REF#refs/tags/}" ]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION#v}"
+            echo "Using tag: v${VERSION}"
+          elif [ -n "$FORCE_VERSION" ]; then
+            VERSION="${FORCE_VERSION#v}"
+            echo "Using forced version: ${VERSION}"
+          else
+            # Tags are already there with fetch-depth: 0; refresh them when possible
+            git fetch --tags --force || echo "::warning::could not refresh tags, using the local ones"
+            YEAR_MONTH=$(date +'%Y.%-m')                                  # 2026.6
+            # Tags with a zero-padded month (v2026.06.x) count too
+            LATEST_INDEX=$(git tag -l "v${YEAR_MONTH}.*" "v$(date +'%Y.%m').*" \
+              | sed -E 's/^v[0-9]+\.[0-9]+\.([0-9]+).*/\1/' | sort -n | tail -n 1)
+            VERSION="${YEAR_MONTH}.$(( ${LATEST_INDEX:-0} + 1 ))"
+            echo "Auto-generated version: ${VERSION}"
+          fi
+
+          # The version is interpolated in later steps: only accept YEAR.MONTH.INDEX
+          # with an optional pre-release suffix
+          if ! [[ "$VERSION" =~ ^([0-9]{4})\.([0-9]{1,2})\.([0-9]+)(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid version: ${VERSION} (expected YYYY.M.X)" >&2
+            exit 1
+          fi
+          # Normalise each segment (strip leading zeros, valid SemVer for Helm):
+          # 2026.06.01 -> 2026.6.1
+          MONTH=$((10#${BASH_REMATCH[2]}))
+          if [ "$MONTH" -lt 1 ] || [ "$MONTH" -gt 12 ]; then
+            echo "Invalid month in version: ${VERSION}" >&2
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[1]}.${MONTH}.$((10#${BASH_REMATCH[3]}))${BASH_REMATCH[4]}"
+          TAG="v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # A suffix (-rc.1, -beta...) marks a pre-release
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "::notice::vaultwarden-exporter ${VERSION} (tag ${TAG})"
+
+      # Commit date rather than the current date: rebuilding a commit gives
+      # the same binaries and images
+      - name: Get build date
+        id: build_date
+        run: |
+          echo "build_date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  # =============================================================================
+  # Job 2: Build Multi-Architecture Binaries
+  # =============================================================================
+  build-binaries:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: 7
+          # macOS builds
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          # Windows builds
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-environment
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          # Set binary name based on OS
+          BINARY_NAME="vaultwarden-exporter-${{ matrix.goos }}-${{ matrix.goarch }}"
+
+          # Add ARM version suffix if applicable
+          if [ -n "${{ matrix.goarm }}" ]; then
+            BINARY_NAME="${BINARY_NAME}v${{ matrix.goarm }}"
+          fi
+
+          # Add .exe extension for Windows
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+
+          echo "Building ${BINARY_NAME}..."
+
+          go build -v \
+            -ldflags="-w -s \
+              -X 'main.version=${{ needs.prepare.outputs.version }}' \
+              -X 'main.commit=${GITHUB_SHA}' \
+              -X 'main.buildDate=${{ needs.prepare.outputs.build_date }}'" \
+            -trimpath \
+            -o "${BINARY_NAME}" \
+            ./cmd/vaultwarden-exporter
+
+          echo "BINARY_NAME=${BINARY_NAME}" >> "$GITHUB_ENV"
+
+      - name: Generate checksums
+        run: |
+          sha256sum "${BINARY_NAME}" > "${BINARY_NAME}.sha256"
+
+      - name: Verify binary (Linux only)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          chmod +x "${BINARY_NAME}"
+          file "${BINARY_NAME}"
+          ./"${BINARY_NAME}" --version || true
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('-v{0}', matrix.goarm) || '' }}
+          path: |
+            vaultwarden-exporter-*
+            *.sha256
+          retention-days: 5
+
+  # =============================================================================
+  # Job 3: Build Multi-Architecture Docker Images (per platform)
+  # =============================================================================
+  build-multiarch-images:
+    name: Build Docker Images (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm/v7
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract platform architecture
+        run: |
+          echo "PLATFORM_ARCH=${platform##*/}" >> "$GITHUB_ENV"
+        env:
+          platform: ${{ matrix.platform }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - name: Generate Docker metadata and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          PLATFORM_ARCH: ${{ env.PLATFORM_ARCH }}
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}-${{ env.PLATFORM_ARCH }}
+          labels: |
+            org.opencontainers.image.title=Vaultwarden Exporter
+            org.opencontainers.image.description=Prometheus metrics and audit event stream for Vaultwarden (${{ env.PLATFORM_ARCH }})
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.vendor=Maxime Wewer
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/README.md
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push platform-specific image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_SUMMARY: false
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          # SLSA provenance and SBOM attested next to the image
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ needs.prepare.outputs.build_date }}
+          tags: ${{ steps.meta.outputs.tags }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,oci-mediatypes=true
+
+  # =============================================================================
+  # Job 4: Create Multi-Architecture Manifest
+  # =============================================================================
+  create-multiarch-manifest:
+    name: Create Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: [prepare, build-multiarch-images]
+    permissions:
+      contents: read
+      packages: write
+      # Keyless signature: the identity of this workflow certifies the image
+      id-token: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Generate multiarch manifest metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}
+          annotations: |
+            type=org.opencontainers.image.description,value=Prometheus metrics and audit event stream for Vaultwarden
+          # latest only moves on stable releases, never on a -rc pre-release
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.is_prerelease == 'false' }}
+
+      - name: Create multiarch manifest and push
+        id: manifest-annotate
+        run: |
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            --annotation='index:org.opencontainers.image.description=Prometheus metrics and audit event stream for Vaultwarden' \
+            --annotation='index:org.opencontainers.image.source=https://github.com/${{ github.repository }}' \
+            --annotation='index:org.opencontainers.image.licenses=MIT' \
+            ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}-amd64 \
+            ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}-arm64 \
+            ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}-v7
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)
+          cosign sign --yes "${IMAGE}@${digest}"
+
+      - name: Inspect multiarch manifest
+        id: inspect
+        run: |
+          docker buildx imagetools inspect '${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}'
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 90
+
+  # =============================================================================
+  # Job 6: Create GitHub Release
+  # =============================================================================
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build-binaries, create-multiarch-manifest]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: binaries
+          merge-multiple: true
+
+      - name: Download SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom
+          path: sbom
+
+      - name: Generate combined checksums file
+        run: |
+          # Binaries only, not their individual checksum files
+          cd binaries
+          find . -maxdepth 1 -type f -name 'vaultwarden-exporter-*' ! -name '*.sha256' -printf '%f\n' | sort |
+            xargs sha256sum > ../SHA256SUMS.txt
+          cd ..
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # Previous release tag: the highest vYYYY.M.X tag other than this one
+          # (on workflow_dispatch, the tag of this release does not exist yet)
+          PREVIOUS_TAG=$(git tag -l 'v*.*.*' --sort=-v:refname | grep -vx "${{ needs.prepare.outputs.tag }}" | head -n 1 || true)
+
+          # Binary list, built from the downloaded artifacts so that it follows
+          # the build matrix: vaultwarden-exporter-OS-ARCH[vARM][.exe]
+          BINARIES=$(find binaries -maxdepth 1 -type f -name 'vaultwarden-exporter-*' ! -name '*.sha256' -printf '%f\n' | sort |
+            sed -E 's/^(vaultwarden-exporter-([a-z]+)-([a-z0-9]+)(\.exe)?)$/- `\1` (\2\/\3)/; s/\/armv([0-9]+)\)$/\/arm\/v\1)/')
+
+          # Generate changelog
+          cat << EOF > release_notes.md
+          ## Vaultwarden Exporter ${{ needs.prepare.outputs.version }}
+
+          ### What's Changed
+
+          EOF
+
+          if [ -n "$PREVIOUS_TAG" ]; then
+            {
+              echo "Changes since ${PREVIOUS_TAG}:"
+              echo ""
+              git log "${PREVIOUS_TAG}..HEAD" \
+                --pretty=format:"* %s (%h)" \
+                --no-merges
+            } >> release_notes.md
+          else
+            echo "Initial release" >> release_notes.md
+          fi
+
+          cat << EOF >> release_notes.md
+
+
+          ### Docker Images
+
+          Multi-architecture Docker images are available:
+
+          \`\`\`bash
+          docker pull ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}
+          \`\`\`
+
+          Docker platforms:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm/v7
+
+          ### Kubernetes
+
+          Deployed by the [vaultwarden-helm](https://github.com/MaximeWewer/vaultwarden-helm) chart, or with the plain
+          manifests of \`deployments/kubernetes/\`.
+
+          ### Binary Downloads
+
+          Download the binary for your platform from the assets below:
+
+          ${BINARIES}
+
+          ### Verification
+
+          Verify binary checksums:
+          \`\`\`bash
+          sha256sum -c SHA256SUMS.txt
+          \`\`\`
+
+          ---
+
+          **Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${{ needs.prepare.outputs.tag }}
+          EOF
+
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          # On workflow_dispatch the tag is created on the commit that was built
+          target_commitish: ${{ github.sha }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.is_prerelease }}
+          files: |
+            binaries/vaultwarden-exporter-*
+            sbom/sbom.spdx.json
+            SHA256SUMS.txt
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: false
+
+      - name: Generate release summary
+        env:
+          IS_PRERELEASE: ${{ needs.prepare.outputs.is_prerelease }}
+        run: |
+          LATEST_LINE=""
+          if [ "$IS_PRERELEASE" = "false" ]; then
+            LATEST_LINE="- \`${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:latest\`"
+          fi
+
+          cat << EOF >> "$GITHUB_STEP_SUMMARY"
+          ## Release ${{ needs.prepare.outputs.version }} Created Successfully
+
+          ### Artifacts Published
+
+          #### Docker Images
+          - \`${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}\`
+          ${LATEST_LINE}
+
+          #### Binaries
+          - Linux (amd64, arm64, armv7)
+          - macOS (amd64, arm64)
+          - Windows (amd64, arm64)
+
+          ### Links
+          - [GitHub Release](https://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.tag }})
+          - [Docker Image](https://${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }})
+          EOF
+
+  # =============================================================================
+  # Job 7: Post-Release Verification
+  # =============================================================================
+  verify-release:
+    name: Verify Release
+    runs-on: ubuntu-latest
+    needs: [prepare, create-release]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Verify Docker image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}
+          docker inspect ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify image signature
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name_lower }}:${{ needs.prepare.outputs.version }}
+        run: |
+          cosign verify "${IMAGE}" \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/build-and-release.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > /dev/null
+
+      - name: Verification summary
+        run: |
+          {
+            echo "## Release Verification Completed"
+            echo ""
+            echo "All artifacts have been successfully verified:"
+            echo "- Docker image is pullable and inspectable"
+            echo "- Image signature is valid"
+          } >> "$GITHUB_STEP_SUMMARY"

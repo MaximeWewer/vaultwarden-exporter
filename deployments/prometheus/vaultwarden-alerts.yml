@@ -1,0 +1,97 @@
+# Alerting rules for vaultwarden-exporter. Thresholds are starting points:
+# tune them to the size of your instance.
+groups:
+  - name: vaultwarden-exporter
+    rules:
+      - alert: VaultwardenExporterQueriesFailing
+        expr: vaultwarden_exporter_up == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Vaultwarden metrics queries are failing
+          description: >-
+            Some database queries of {{ $labels.instance }} fail (see
+            vaultwarden_exporter_query_errors_total and the exporter logs): database
+            unreachable, missing grant, or a Vaultwarden schema change.
+
+      - alert: VaultwardenMetricsStale
+        expr: time() - vaultwarden_exporter_last_refresh_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Vaultwarden metrics are not refreshed
+          description: The last metrics refresh of {{ $labels.instance }} is older than 15 minutes.
+
+      - alert: VaultwardenEventStreamStalled
+        expr: time() - vaultwarden_exporter_events_last_poll_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Vaultwarden audit events are no longer exported
+          description: >-
+            {{ $labels.instance }} has not completed an event poll for 15 minutes:
+            audit events are not shipped to the SIEM. Events stored meanwhile are
+            exported on recovery only while they stay inside events.late_window.
+
+      - alert: VaultwardenEventStreamErrors
+        expr: increase(vaultwarden_exporter_events_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Vaultwarden event stream errors ({{ $labels.stage }})
+          description: >-
+            {{ $labels.instance }} hit {{ $value | humanize }} event stream errors at stage
+            {{ $labels.stage }} in 15 minutes (query: database, sink: output, state: cursor save).
+
+      - alert: VaultwardenFailedLoginsSpike
+        expr: sum by (instance) (increase(vaultwarden_audit_events_total{event_name="UserFailedLogIn"}[10m])) > 20
+        labels:
+          severity: warning
+        annotations:
+          summary: Many failed Vaultwarden logins
+          description: >-
+            {{ $value | humanize }} failed logins in 10 minutes on {{ $labels.instance }}:
+            possible password guessing. Check the UserFailedLogIn events (ip, user_email).
+
+      - alert: VaultwardenFailedTwoFactor
+        expr: sum by (instance) (increase(vaultwarden_audit_events_total{event_name="UserFailedLogIn2fa"}[15m])) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: Wrong two-factor codes on Vaultwarden
+          description: >-
+            {{ $value | humanize }} wrong two-factor codes in 15 minutes on {{ $labels.instance }}:
+            the master password was accepted, so it may be known to someone else.
+            Check the UserFailedLogIn2fa events (user_email, ip).
+
+      - alert: VaultwardenIncompleteTwoFactorLogins
+        expr: vaultwarden_two_factor_incomplete_logins > 10
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: Many logins stuck at the second factor
+          description: >-
+            {{ $value | humanize }} logins passed the master password but not the second
+            factor on {{ $labels.instance }}: valid passwords may be in the wrong hands.
+
+      - alert: VaultwardenVaultExported
+        expr: >-
+          sum by (instance, event_name) (increase(vaultwarden_audit_events_total{event_name=~"UserClientExportedVault|OrganizationClientExportedVault"}[10m])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: A Vaultwarden vault was exported
+          description: "{{ $labels.event_name }} on {{ $labels.instance }}: check the event for the user and the device."
+
+      - alert: VaultwardenUsersWithoutTwoFactor
+        expr: vaultwarden_users_without_two_factor > 0
+        for: 7d
+        labels:
+          severity: info
+        annotations:
+          summary: Vaultwarden users without two-factor authentication
+          description: "{{ $value | humanize }} enabled users of {{ $labels.instance }} have no two-factor method."

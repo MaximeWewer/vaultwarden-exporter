@@ -1,0 +1,8 @@
+# Only the Go sources are needed to build the image
+.git
+.github
+deployments
+grafana
+*.md
+**/*_test.go
+coverage.out

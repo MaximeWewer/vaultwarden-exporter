@@ -1,0 +1,5 @@
+# Binaries and test artifacts
+/vaultwarden-exporter
+coverage.out
+*.test
+dist/

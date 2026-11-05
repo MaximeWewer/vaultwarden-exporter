@@ -1,0 +1,77 @@
+# promtool test rules deployments/prometheus/tests/alerts_test.yml
+rule_files:
+  - ../vaultwarden-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: failed logins spike, vault export, queries failing
+    interval: 1m
+    input_series:
+      - series: 'vaultwarden_audit_events_total{instance="vw",event_name="UserFailedLogIn"}'
+        values: '0+5x15'
+      - series: 'vaultwarden_audit_events_total{instance="vw",event_name="UserClientExportedVault"}'
+        values: '0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'vaultwarden_exporter_up{instance="vw"}'
+        values: '1 1 0x14'
+      - series: 'vaultwarden_audit_events_total{instance="vw",event_name="UserFailedLogIn2fa"}'
+        values: '0 1 2 3 4 5 5 5 5 5 5 5 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VaultwardenFailedLoginsSpike
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: vw}
+            exp_annotations:
+              summary: Many failed Vaultwarden logins
+              description: "50 failed logins in 10 minutes on vw: possible password guessing. Check the UserFailedLogIn events (ip, user_email)."
+      - eval_time: 5m
+        alertname: VaultwardenVaultExported
+        exp_alerts:
+          - exp_labels: {severity: info, instance: vw, event_name: UserClientExportedVault}
+            exp_annotations:
+              summary: A Vaultwarden vault was exported
+              description: "UserClientExportedVault on vw: check the event for the user and the device."
+      - eval_time: 5m
+        alertname: VaultwardenFailedTwoFactor
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: vw}
+            exp_annotations:
+              summary: Wrong two-factor codes on Vaultwarden
+              description: "5 wrong two-factor codes in 15 minutes on vw: the master password was accepted, so it may be known to someone else. Check the UserFailedLogIn2fa events (user_email, ip)."
+      - eval_time: 8m
+        alertname: VaultwardenExporterQueriesFailing
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: VaultwardenExporterQueriesFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: vw}
+            exp_annotations:
+              summary: Vaultwarden metrics queries are failing
+              description: "Some database queries of vw fail (see vaultwarden_exporter_query_errors_total and the exporter logs): database unreachable, missing grant, or a Vaultwarden schema change."
+
+  - name: stalled event stream
+    interval: 1m
+    input_series:
+      # Last poll frozen at t=0
+      - series: 'vaultwarden_exporter_events_last_poll_timestamp_seconds{instance="vw"}'
+        values: '0x30'
+      - series: 'vaultwarden_exporter_events_errors_total{instance="vw",stage="query"}'
+        values: '0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VaultwardenEventStreamStalled
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: VaultwardenEventStreamStalled
+        exp_alerts:
+          - exp_labels: {severity: critical, instance: vw}
+            exp_annotations:
+              summary: Vaultwarden audit events are no longer exported
+              description: "vw has not completed an event poll for 15 minutes: audit events are not shipped to the SIEM. Events stored meanwhile are exported on recovery only while they stay inside events.late_window."
+      - eval_time: 16m
+        alertname: VaultwardenEventStreamErrors
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: vw, stage: query}
+            exp_annotations:
+              summary: Vaultwarden event stream errors (query)
+              description: "vw hit 15 event stream errors at stage query in 15 minutes (query: database, sink: output, state: cursor save)."
