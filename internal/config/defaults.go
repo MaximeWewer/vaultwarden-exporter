@@ -67,6 +67,12 @@ func ApplyDefaults(cfg *Config) {
 	if ev.Output.Type == "" {
 		ev.Output.Type = OutputStdout
 	}
+	if ev.Output.Syslog.Protocol == "" {
+		ev.Output.Syslog.Protocol = "tcp"
+	}
+	if ev.Output.Syslog.Timeout == 0 {
+		ev.Output.Syslog.Timeout = 5 * time.Second
+	}
 	if ev.State.Backend == "" {
 		ev.State.Backend = StateFile
 	}

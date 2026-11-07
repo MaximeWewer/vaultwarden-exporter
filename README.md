@@ -8,7 +8,7 @@ Vaultwarden database (read-only) and
   and memberships, vault items, attachments, Sends, devices, emergency access;
 - streams the **audit events** (logins, failed logins, vault exports, items
   viewed or copied, membership and policy changes...) as **JSON lines** on
-  stdout or to a file, for your SIEM.
+  stdout, to a file, or directly to a remote syslog receiver, for your SIEM.
 
 Vaultwarden has no metrics endpoint, and only exposes its events per
 organization to an organization admin, never the events outside an
@@ -173,6 +173,50 @@ keeps `member_id` only.
   that name; it is not part of a Helm release, so upgrades and GitOps syncs
   never reset it), `memory` (tests).
 
+### Direct syslog output
+
+No log-forwarding sidecar is needed when your SIEM accepts syslog:
+
+```yaml
+events:
+  enabled: true
+  output:
+    type: syslog
+    syslog:
+      address: siem.example.com:6514
+      protocol: tls             # tcp (default), udp or tls
+      # ca_file: /etc/syslog/ca.pem  # optional PEM trust bundle; otherwise system roots
+      timeout: 5s               # total dial + TLS handshake + write deadline per batch
+```
+
+Each message uses RFC3164, facility `user`, severity `info`, and the tag
+`vaultwarden-exporter`; the message body is the original event JSON. TCP uses
+newline-delimited framing (RFC6587 non-transparent framing); TLS uses
+octet-counted frames (`<byte-length> <message>`); UDP sends one datagram per
+event. Messages are not truncated: configure the receiver to
+accept the largest event JSON, including its syslog header.
+
+The exporter opens a connection for each batch. A connection or write error
+leaves that batch uncommitted so the next poll retries it. Partially sent
+batches can be replayed; deduplicate on `event_id` at the receiver. A successful
+socket write does not acknowledge storage in the SIEM, and UDP can lose
+messages without reporting an error. State must remain on persistent storage.
+
+TLS requires TLS 1.2 or newer and verifies the receiver's certificate chain,
+validity period and hostname/IP against `address`. There is no insecure mode
+or fallback to plaintext. When `ca_file` is set, its certificates replace the
+system trust roots. The file is loaded at startup; restart after changing it.
+An unreadable file or a PEM bundle with no certificates prevents startup.
+Client certificates (mutual TLS) are not supported.
+
+Plain TCP and UDP remain unencrypted and unauthenticated; use them only over
+a trusted private network or a secured tunnel.
+
+For Wazuh, use a syslog listener with restricted `allowed-ips`, not the agent
+protocol. For TLS, point the exporter at a TLS-capable syslog receiver/relay
+(such as rsyslog or syslog-ng) in front of Wazuh. Verify rules for the JSON
+body with `wazuh-logtest`.
+
 ## Configuration
 
 Priority: environment variables > YAML file (`--config`) > defaults. The YAML
@@ -201,8 +245,13 @@ events:
   late_window: 1h
   start_from: now              # first start only: now or beginning
   output:
-    type: stdout               # stdout or file
+    type: stdout               # stdout, file or syslog
     path: ""                   # file: appended, reopened for every batch (logrotate friendly)
+    syslog:
+      address: ""              # required for syslog, host:port (IPv6: [host]:port)
+      protocol: tcp            # tcp, udp or tls
+      timeout: 5s              # dial + TLS handshake + write deadline per batch
+      ca_file: ""              # TLS PEM trust bundle; empty uses system roots
   state:
     backend: file              # file, kubernetes or memory
     path: /var/lib/vaultwarden-exporter/state.json
@@ -234,6 +283,10 @@ events:
 | `VAULTWARDEN_EXPORTER_EVENTS_LATE_WINDOW` | `events.late_window` |
 | `VAULTWARDEN_EXPORTER_EVENTS_START_FROM` | `events.start_from` |
 | `VAULTWARDEN_EXPORTER_EVENTS_OUTPUT` / `_OUTPUT_PATH` | `events.output.type` / `events.output.path` |
+| `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_ADDRESS` | `events.output.syslog.address` |
+| `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL` | `events.output.syslog.protocol` |
+| `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_TIMEOUT` | `events.output.syslog.timeout` |
+| `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CA_FILE` | `events.output.syslog.ca_file` |
 | `VAULTWARDEN_EXPORTER_EVENTS_STATE_BACKEND` | `events.state.backend` |
 | `VAULTWARDEN_EXPORTER_EVENTS_STATE_PATH` | `events.state.path` |
 | `VAULTWARDEN_EXPORTER_EVENTS_STATE_CONFIGMAP` / `_STATE_NAMESPACE` | `events.state.configmap` / `events.state.namespace` |
