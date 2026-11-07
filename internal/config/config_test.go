@@ -156,3 +156,62 @@ func TestRedactURL(t *testing.T) {
 	assert.NotContains(t, cfg.Redacted().Database.URL, ":p@")
 	assert.Equal(t, "mysql://u:p@db/vw", cfg.Database.URL, "the original is untouched")
 }
+
+func TestSyslogConfiguration(t *testing.T) {
+	p := writeFile(t, `
+database:
+  url: postgresql://vw@db/vw
+events:
+  enabled: true
+  output:
+    type: syslog
+    syslog:
+      address: siem.example.com:514
+`)
+	cfg, err := LoadFromYamlWithEnvOverrides(p)
+	require.NoError(t, err)
+	assert.Equal(t, OutputSyslog, cfg.Events.Output.Type)
+	assert.Equal(t, SyslogConfig{Address: "siem.example.com:514", Protocol: "tcp", Timeout: 5 * time.Second}, cfg.Events.Output.Syslog)
+
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_ADDRESS", "[::1]:5514")
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL", "udp")
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_TIMEOUT", "2s")
+	cfg, err = LoadFromYamlWithEnvOverrides(p)
+	require.NoError(t, err)
+	assert.Equal(t, SyslogConfig{Address: "[::1]:5514", Protocol: "udp", Timeout: 2 * time.Second}, cfg.Events.Output.Syslog)
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL", "tls")
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CA_FILE", "/etc/syslog/ca.pem")
+	cfg, err = LoadFromYamlWithEnvOverrides(p)
+	require.NoError(t, err)
+	assert.Equal(t, "tls", cfg.Events.Output.Syslog.Protocol)
+	assert.Equal(t, "/etc/syslog/ca.pem", cfg.Events.Output.Syslog.CAFile)
+}
+
+func TestSyslogValidation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		cfg  SyslogConfig
+		want string
+	}{
+		{"missing address", SyslogConfig{Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"missing port", SyslogConfig{Address: "siem", Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"empty host", SyslogConfig{Address: ":514", Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"invalid port", SyslogConfig{Address: "siem:65536", Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"zero port", SyslogConfig{Address: "siem:0", Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"named port", SyslogConfig{Address: "siem:syslog", Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"invalid host", SyslogConfig{Address: "bad\nhost:514", Protocol: "tcp", Timeout: time.Second}, "address"},
+		{"invalid protocol", SyslogConfig{Address: "siem:514", Protocol: "http", Timeout: time.Second}, "protocol"},
+		{"negative timeout", SyslogConfig{Address: "siem:514", Protocol: "tcp", Timeout: -time.Second}, "timeout"},
+		{"CA without TLS", SyslogConfig{Address: "siem:514", Protocol: "tcp", Timeout: time.Second, CAFile: "ca.pem"}, "ca_file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &Config{Database: DatabaseConfig{URL: "postgresql://db/vw"}}
+			ApplyDefaults(cfg)
+			cfg.Events.Enabled = true
+			cfg.Events.Output = OutputConfig{Type: OutputSyslog, Syslog: tc.cfg}
+			assert.ErrorContains(t, Validate(cfg), "events.output.syslog."+tc.want)
+		})
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -20,6 +21,49 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBuildSyslogOutput(t *testing.T) {
+	db := vwtest.New(t)
+	db.InsertEvent(t, vwtest.Event{UUID: vwtest.UUID(1), Type: 1005, Date: time.Now().Add(-time.Minute)})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	metrics := false
+	cfg := &config.Config{Database: config.DatabaseConfig{URL: "sqlite://" + dbPath(t, db)}}
+	cfg.Metrics.Enabled = &metrics
+	cfg.Events.Enabled = true
+	cfg.Events.StartFrom = config.StartBeginning
+	cfg.Events.State.Backend = config.StateMemory
+	cfg.Events.Output.Type = config.OutputSyslog
+	cfg.Events.Output.Syslog.Address = listener.Addr().String()
+	config.ApplyDefaults(cfg)
+	require.NoError(t, config.Validate(cfg))
+	var stdout bytes.Buffer
+	app, err := build(cfg, &stdout)
+	require.NoError(t, err)
+	defer app.db.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- app.tasks["events"](ctx) }()
+	require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(3*time.Second)))
+	conn, err := listener.Accept()
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	scanner := bufio.NewScanner(conn)
+	require.True(t, scanner.Scan())
+	assert.Contains(t, scanner.Text(), `vaultwarden-exporter: {"source":"vaultwarden"`)
+	assert.Contains(t, scanner.Text(), `"event_name":"UserFailedLogIn"`)
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("event task did not stop")
+	}
+	assert.Empty(t, stdout.String(), "syslog events must not also go to stdout")
+}
 
 // syncBuffer is a goroutine-safe buffer (the exporter writes while the test reads)
 type syncBuffer struct {

@@ -18,6 +18,7 @@ import (
 const (
 	OutputStdout = "stdout"
 	OutputFile   = "file"
+	OutputSyslog = "syslog"
 )
 
 // Event state backends
@@ -97,8 +98,17 @@ type EventsConfig struct {
 
 // OutputConfig is where the event JSON lines are written
 type OutputConfig struct {
-	Type string `yaml:"type" json:"type"` // stdout, file
-	Path string `yaml:"path" json:"path"` // file output
+	Type   string       `yaml:"type" json:"type"` // stdout, file, syslog
+	Path   string       `yaml:"path" json:"path"` // file output
+	Syslog SyslogConfig `yaml:"syslog" json:"syslog"`
+}
+
+// SyslogConfig configures remote RFC3164 output with the event JSON as MSG.
+type SyslogConfig struct {
+	Address  string        `yaml:"address" json:"address"`   // host:port
+	Protocol string        `yaml:"protocol" json:"protocol"` // tcp, udp or tls
+	Timeout  time.Duration `yaml:"timeout" json:"timeout"`   // per batch, including dialing
+	CAFile   string        `yaml:"ca_file" json:"ca_file"`   // TLS PEM trust bundle; empty uses system roots
 }
 
 // StateConfig is where the cursor is persisted between restarts
@@ -236,6 +246,10 @@ func applyEnvOverrides(cfg *Config) error {
 	e.string("EVENTS_START_FROM", &cfg.Events.StartFrom)
 	e.string("EVENTS_OUTPUT", &cfg.Events.Output.Type)
 	e.string("EVENTS_OUTPUT_PATH", &cfg.Events.Output.Path)
+	e.string("EVENTS_SYSLOG_ADDRESS", &cfg.Events.Output.Syslog.Address)
+	e.string("EVENTS_SYSLOG_PROTOCOL", &cfg.Events.Output.Syslog.Protocol)
+	e.duration("EVENTS_SYSLOG_TIMEOUT", &cfg.Events.Output.Syslog.Timeout)
+	e.string("EVENTS_SYSLOG_CA_FILE", &cfg.Events.Output.Syslog.CAFile)
 	e.string("EVENTS_STATE_BACKEND", &cfg.Events.State.Backend)
 	e.string("EVENTS_STATE_PATH", &cfg.Events.State.Path)
 	e.string("EVENTS_STATE_CONFIGMAP", &cfg.Events.State.ConfigMap)
