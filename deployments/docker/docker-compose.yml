@@ -44,11 +44,21 @@ services:
       DATABASE_URL: "sqlite:///data/db.sqlite3"
       VAULTWARDEN_EXPORTER_EVENTS_ENABLED: "true"
       VAULTWARDEN_EXPORTER_EVENTS_STATE_PATH: "/state/state.json"
+      # Send events to a remote syslog receiver instead of stdout
+      # (also mount the TLS files below, read-only):
+      # VAULTWARDEN_EXPORTER_EVENTS_OUTPUT: "syslog"
+      # VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_ADDRESS: "siem.example.com:6514"
+      # VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL: "tls"        # tcp, udp or tls
+      # VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_FORMAT: "rfc5424"      # rfc3164 or rfc5424
+      # VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CA_FILE: "/etc/syslog/ca.pem"
+      # VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CERT_FILE: "/etc/syslog/tls.crt"  # mutual TLS
+      # VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_KEY_FILE: "/etc/syslog/tls.key"
     ports:
       - "9776:9776"
     volumes:
       - vw-data:/data
       - exporter-state:/state
+      # - ./syslog-tls:/etc/syslog:ro
     read_only: true
     security_opt:
       - no-new-privileges:true

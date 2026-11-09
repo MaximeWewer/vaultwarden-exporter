@@ -185,12 +185,20 @@ events:
     syslog:
       address: siem.example.com:6514
       protocol: tls             # tcp (default), udp or tls
-      # ca_file: /etc/syslog/ca.pem  # optional PEM trust bundle; otherwise system roots
+      format: rfc5424           # rfc3164 (default) or rfc5424
+      # ca_file: /etc/syslog/ca.pem    # optional PEM trust bundle; otherwise system roots
+      # cert_file: /etc/syslog/tls.crt # optional client certificate (mutual TLS)
+      # key_file: /etc/syslog/tls.key  # its private key, required with cert_file
       timeout: 5s               # total dial + TLS handshake + write deadline per batch
 ```
 
-Each message uses RFC3164, facility `user`, severity `info`, and the tag
-`vaultwarden-exporter`; the message body is the original event JSON. TCP uses
+Each message uses facility `user`, severity `info`, and the app name
+`vaultwarden-exporter`; the message body is the original event JSON.
+`rfc3164` (default) sends the classic BSD header, local time without year or
+timezone (`<14>Nov  9 10:04:05 host vaultwarden-exporter: {...}`).
+`rfc5424` sends a UTC timestamp with year and microseconds, plus the process
+ID, without structured data
+(`<14>1 2026-11-09T09:04:05.123456Z host vaultwarden-exporter 1 - - {...}`). TCP uses
 newline-delimited framing (RFC6587 non-transparent framing); TLS uses
 octet-counted frames (`<byte-length> <message>`); UDP sends one datagram per
 event. Messages are not truncated: configure the receiver to
@@ -205,9 +213,15 @@ messages without reporting an error. State must remain on persistent storage.
 TLS requires TLS 1.2 or newer and verifies the receiver's certificate chain,
 validity period and hostname/IP against `address`. There is no insecure mode
 or fallback to plaintext. When `ca_file` is set, its certificates replace the
-system trust roots. The file is loaded at startup; restart after changing it.
-An unreadable file or a PEM bundle with no certificates prevents startup.
-Client certificates (mutual TLS) are not supported.
+system trust roots. For receivers that require mutual TLS, set `cert_file` and
+`key_file` (PEM; RSA, ECDSA or Ed25519 key). The TLS files are checked at
+startup (an unreadable file, a PEM bundle with no certificates or a key that
+does not match its certificate prevents startup) and re-read for every batch,
+so certificates rotated on disk (cert-manager, Vault agent) are used without a
+restart; a bad file at runtime fails that batch, which is retried. With
+TLS 1.3, a receiver that rejects the client certificate does so after the
+handshake, so the exporter may not see the error: check the receiver logs when
+setting up mutual TLS.
 
 Plain TCP and UDP remain unencrypted and unauthenticated; use them only over
 a trusted private network or a secured tunnel.
@@ -250,8 +264,11 @@ events:
     syslog:
       address: ""              # required for syslog, host:port (IPv6: [host]:port)
       protocol: tcp            # tcp, udp or tls
+      format: rfc3164          # rfc3164 or rfc5424
       timeout: 5s              # dial + TLS handshake + write deadline per batch
       ca_file: ""              # TLS PEM trust bundle; empty uses system roots
+      cert_file: ""            # TLS client certificate (mutual TLS)
+      key_file: ""             # TLS client private key, required with cert_file
   state:
     backend: file              # file, kubernetes or memory
     path: /var/lib/vaultwarden-exporter/state.json
@@ -285,8 +302,10 @@ events:
 | `VAULTWARDEN_EXPORTER_EVENTS_OUTPUT` / `_OUTPUT_PATH` | `events.output.type` / `events.output.path` |
 | `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_ADDRESS` | `events.output.syslog.address` |
 | `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL` | `events.output.syslog.protocol` |
+| `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_FORMAT` | `events.output.syslog.format` |
 | `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_TIMEOUT` | `events.output.syslog.timeout` |
 | `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CA_FILE` | `events.output.syslog.ca_file` |
+| `VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CERT_FILE` / `_KEY_FILE` | `events.output.syslog.cert_file` / `key_file` |
 | `VAULTWARDEN_EXPORTER_EVENTS_STATE_BACKEND` | `events.state.backend` |
 | `VAULTWARDEN_EXPORTER_EVENTS_STATE_PATH` | `events.state.path` |
 | `VAULTWARDEN_EXPORTER_EVENTS_STATE_CONFIGMAP` / `_STATE_NAMESPACE` | `events.state.configmap` / `events.state.namespace` |

@@ -82,8 +82,17 @@ func validateEvents(ev *EventsConfig, add func(string, ...any)) {
 		if !slices.Contains([]string{"tcp", "udp", "tls"}, ev.Output.Syslog.Protocol) {
 			add("events.output.syslog.protocol must be tcp, udp or tls")
 		}
+		if !slices.Contains([]string{SyslogRFC3164, SyslogRFC5424}, ev.Output.Syslog.Format) {
+			add("events.output.syslog.format must be %q or %q", SyslogRFC3164, SyslogRFC5424)
+		}
 		if ev.Output.Syslog.CAFile != "" && ev.Output.Syslog.Protocol != "tls" {
 			add("events.output.syslog.ca_file requires protocol=tls")
+		}
+		if (ev.Output.Syslog.CertFile == "") != (ev.Output.Syslog.KeyFile == "") {
+			add("events.output.syslog.cert_file and key_file must be set together")
+		}
+		if ev.Output.Syslog.CertFile != "" && ev.Output.Syslog.Protocol != "tls" {
+			add("events.output.syslog.cert_file requires protocol=tls")
 		}
 		if ev.Output.Syslog.Timeout <= 0 {
 			add("events.output.syslog.timeout must be > 0")

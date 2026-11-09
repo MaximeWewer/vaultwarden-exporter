@@ -171,20 +171,27 @@ events:
 	cfg, err := LoadFromYamlWithEnvOverrides(p)
 	require.NoError(t, err)
 	assert.Equal(t, OutputSyslog, cfg.Events.Output.Type)
-	assert.Equal(t, SyslogConfig{Address: "siem.example.com:514", Protocol: "tcp", Timeout: 5 * time.Second}, cfg.Events.Output.Syslog)
+	assert.Equal(t, SyslogConfig{Address: "siem.example.com:514", Protocol: "tcp", Format: SyslogRFC3164, Timeout: 5 * time.Second}, cfg.Events.Output.Syslog)
 
 	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_ADDRESS", "[::1]:5514")
 	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL", "udp")
 	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_TIMEOUT", "2s")
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_FORMAT", "rfc5424")
 	cfg, err = LoadFromYamlWithEnvOverrides(p)
 	require.NoError(t, err)
-	assert.Equal(t, SyslogConfig{Address: "[::1]:5514", Protocol: "udp", Timeout: 2 * time.Second}, cfg.Events.Output.Syslog)
+	assert.Equal(t, SyslogConfig{Address: "[::1]:5514", Protocol: "udp", Format: SyslogRFC5424, Timeout: 2 * time.Second}, cfg.Events.Output.Syslog)
 	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL", "tls")
 	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CA_FILE", "/etc/syslog/ca.pem")
 	cfg, err = LoadFromYamlWithEnvOverrides(p)
 	require.NoError(t, err)
 	assert.Equal(t, "tls", cfg.Events.Output.Syslog.Protocol)
 	assert.Equal(t, "/etc/syslog/ca.pem", cfg.Events.Output.Syslog.CAFile)
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CERT_FILE", "/etc/syslog/tls.crt")
+	t.Setenv("VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_KEY_FILE", "/etc/syslog/tls.key")
+	cfg, err = LoadFromYamlWithEnvOverrides(p)
+	require.NoError(t, err)
+	assert.Equal(t, "/etc/syslog/tls.crt", cfg.Events.Output.Syslog.CertFile)
+	assert.Equal(t, "/etc/syslog/tls.key", cfg.Events.Output.Syslog.KeyFile)
 }
 
 func TestSyslogValidation(t *testing.T) {
@@ -204,6 +211,10 @@ func TestSyslogValidation(t *testing.T) {
 		{"invalid protocol", SyslogConfig{Address: "siem:514", Protocol: "http", Timeout: time.Second}, "protocol"},
 		{"negative timeout", SyslogConfig{Address: "siem:514", Protocol: "tcp", Timeout: -time.Second}, "timeout"},
 		{"CA without TLS", SyslogConfig{Address: "siem:514", Protocol: "tcp", Timeout: time.Second, CAFile: "ca.pem"}, "ca_file"},
+		{"invalid format", SyslogConfig{Address: "siem:514", Protocol: "tcp", Format: "rfc5425", Timeout: time.Second}, "format"},
+		{"certificate without key", SyslogConfig{Address: "siem:514", Protocol: "tls", Timeout: time.Second, CertFile: "tls.crt"}, "cert_file and key_file"},
+		{"key without certificate", SyslogConfig{Address: "siem:514", Protocol: "tls", Timeout: time.Second, KeyFile: "tls.key"}, "cert_file and key_file"},
+		{"client certificate without TLS", SyslogConfig{Address: "siem:514", Protocol: "tcp", Timeout: time.Second, CertFile: "tls.crt", KeyFile: "tls.key"}, "cert_file requires"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

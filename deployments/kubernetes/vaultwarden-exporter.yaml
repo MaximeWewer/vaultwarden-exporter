@@ -84,6 +84,25 @@ spec:
               value: "true"
             - name: VAULTWARDEN_EXPORTER_EVENTS_STATE_BACKEND
               value: kubernetes
+            # Send events to a remote syslog receiver instead of stdout.
+            # The TLS files come from the syslog-tls volume below; a
+            # cert-manager Certificate Secret (tls.crt, tls.key, ca.crt) fits
+            # as is, and rotated certificates are used without a restart.
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_OUTPUT
+            #   value: syslog
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_ADDRESS
+            #   value: siem.example.com:6514
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_PROTOCOL
+            #   value: tls              # tcp, udp or tls
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_FORMAT
+            #   value: rfc5424          # rfc3164 or rfc5424
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CA_FILE
+            #   value: /etc/vaultwarden-exporter/syslog/ca.crt
+            # Mutual TLS, when the receiver requires a client certificate:
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_CERT_FILE
+            #   value: /etc/vaultwarden-exporter/syslog/tls.crt
+            # - name: VAULTWARDEN_EXPORTER_EVENTS_SYSLOG_KEY_FILE
+            #   value: /etc/vaultwarden-exporter/syslog/tls.key
           ports:
             - name: metrics
               containerPort: 9776
@@ -120,10 +139,16 @@ spec:
             - name: db
               mountPath: /etc/vaultwarden-exporter/db
               readOnly: true
+            # - name: syslog-tls
+            #   mountPath: /etc/vaultwarden-exporter/syslog
+            #   readOnly: true
       volumes:
         - name: db
           secret:
             secretName: vaultwarden-exporter-db
+        # - name: syslog-tls
+        #   secret:
+        #     secretName: vaultwarden-exporter-syslog-tls
 ---
 apiVersion: v1
 kind: Service

@@ -70,6 +70,9 @@ func ApplyDefaults(cfg *Config) {
 	if ev.Output.Syslog.Protocol == "" {
 		ev.Output.Syslog.Protocol = "tcp"
 	}
+	if ev.Output.Syslog.Format == "" {
+		ev.Output.Syslog.Format = SyslogRFC3164
+	}
 	if ev.Output.Syslog.Timeout == 0 {
 		ev.Output.Syslog.Timeout = 5 * time.Second
 	}

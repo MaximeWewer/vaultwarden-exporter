@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -268,4 +269,152 @@ func TestSyslogTLSHandshakeDeadline(t *testing.T) {
 	var netErr net.Error
 	require.ErrorAs(t, err, &netErr)
 	assert.True(t, netErr.Timeout())
+}
+
+func TestSyslogFormat(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 9, 10, 4, 5, 123456789, time.FixedZone("CET", 3600))
+	line := []byte(`{"event_id":"one"}`)
+	s := &Syslog{cfg: config.SyslogConfig{Format: config.SyslogRFC5424}, hostname: "host", procID: "42"}
+	assert.Equal(t, `<14>1 2026-11-09T09:04:05.123456Z host vaultwarden-exporter 42 - - {"event_id":"one"}`, s.format(now, line))
+	s.cfg.Format = config.SyslogRFC3164
+	assert.Equal(t, `<14>Nov  9 10:04:05 host vaultwarden-exporter: {"event_id":"one"}`, s.format(now, line))
+}
+
+func TestSyslogRFC5424OverTCP(t *testing.T) {
+	t.Parallel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	require.NoError(t, listener.(*net.TCPListener).SetDeadline(time.Now().Add(3*time.Second)))
+	sink, err := NewSyslog(config.SyslogConfig{
+		Address: listener.Addr().String(), Protocol: "tcp", Format: config.SyslogRFC5424, Timeout: time.Second,
+	})
+	require.NoError(t, err)
+	line := []byte(`{"event_id":"one"}`)
+	done := make(chan error, 1)
+	go func() { done <- sink.Write([][]byte{line}) }()
+	conn, err := listener.Accept()
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	scanner := bufio.NewScanner(conn)
+	require.True(t, scanner.Scan())
+	require.NoError(t, <-done)
+	header := `^<14>1 [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z [!-~]+ vaultwarden-exporter [0-9]+ - - `
+	assert.Regexp(t, header, scanner.Text())
+	_, payload, found := strings.Cut(scanner.Text(), " - - ")
+	require.True(t, found)
+	assert.Equal(t, string(line), payload)
+}
+
+func TestSyslogMutualTLS(t *testing.T) {
+	t.Parallel()
+	serverCert, caFile := syslogTLSCertificate(t, "127.0.0.1", false)
+	certFile, keyFile, clientCA := syslogClientCertificate(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{serverCert}, MinVersion: tls.VersionTLS12,
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: clientCA,
+	})
+	require.NoError(t, err)
+	defer listener.Close()
+	type received struct {
+		data []byte
+		peer string
+		err  error
+	}
+	done := make(chan received, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- received{err: err}
+			return
+		}
+		defer conn.Close()
+		tlsConn := conn.(*tls.Conn)
+		if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			done <- received{err: err}
+			return
+		}
+		data, err := io.ReadAll(tlsConn)
+		peer := ""
+		if certs := tlsConn.ConnectionState().PeerCertificates; len(certs) > 0 {
+			peer = certs[0].Subject.CommonName
+		}
+		done <- received{data: data, peer: peer, err: err}
+	}()
+	sink, err := NewSyslog(config.SyslogConfig{
+		Address: listener.Addr().String(), Protocol: "tls", Timeout: 5 * time.Second,
+		CAFile: caFile, CertFile: certFile, KeyFile: keyFile,
+	})
+	require.NoError(t, err)
+	line := []byte(`{"event_id":"mtls"}`)
+	require.NoError(t, sink.Write([][]byte{line}))
+	select {
+	case result := <-done:
+		require.NoError(t, result.err)
+		assert.Equal(t, "vaultwarden-exporter", result.peer, "the receiver authenticated the client")
+		_, message, found := strings.Cut(string(result.data), " ")
+		require.True(t, found)
+		assertSyslogMessage(t, message, line)
+	case <-time.After(10 * time.Second):
+		t.Fatal("TLS receiver did not stop")
+	}
+}
+
+func TestSyslogInvalidClientCertificate(t *testing.T) {
+	t.Parallel()
+	certFile, keyFile, _ := syslogClientCertificate(t)
+	_, otherKey, _ := syslogClientCertificate(t)
+	for _, tc := range []struct {
+		name, cert, key string
+	}{
+		{"missing files", filepath.Join(t.TempDir(), "tls.crt"), filepath.Join(t.TempDir(), "tls.key")},
+		{"mismatched key", certFile, otherKey},
+		{"key as certificate", keyFile, keyFile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewSyslog(config.SyslogConfig{Protocol: "tls", CertFile: tc.cert, KeyFile: tc.key})
+			assert.ErrorContains(t, err, "load syslog client certificate")
+		})
+	}
+}
+
+func TestSyslogReloadsClientCertificate(t *testing.T) {
+	t.Parallel()
+	certFile, keyFile, _ := syslogClientCertificate(t)
+	sink, err := NewSyslog(config.SyslogConfig{
+		Address: "127.0.0.1:1", Protocol: "tls", Timeout: time.Second, CertFile: certFile, KeyFile: keyFile,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(certFile, []byte("rotated badly"), 0o600))
+	assert.ErrorContains(t, sink.Write([][]byte{[]byte(`{}`)}), "load syslog client certificate",
+		"files are re-read for every batch")
+}
+
+// syslogClientCertificate writes a self-signed client certificate and key,
+// and returns their paths with a pool trusting that certificate.
+func syslogClientCertificate(t *testing.T) (string, string, *x509.CertPool) {
+	t.Helper()
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "vaultwarden-exporter"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+	require.NoError(t, os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	require.NoError(t, os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), 0o600))
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return certFile, keyFile, pool
 }

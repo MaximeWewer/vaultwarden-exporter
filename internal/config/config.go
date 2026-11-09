@@ -21,6 +21,12 @@ const (
 	OutputSyslog = "syslog"
 )
 
+// Syslog message formats
+const (
+	SyslogRFC3164 = "rfc3164"
+	SyslogRFC5424 = "rfc5424"
+)
+
 // Event state backends
 const (
 	StateFile       = "file"
@@ -103,12 +109,15 @@ type OutputConfig struct {
 	Syslog SyslogConfig `yaml:"syslog" json:"syslog"`
 }
 
-// SyslogConfig configures remote RFC3164 output with the event JSON as MSG.
+// SyslogConfig configures remote syslog output with the event JSON as MSG.
 type SyslogConfig struct {
-	Address  string        `yaml:"address" json:"address"`   // host:port
-	Protocol string        `yaml:"protocol" json:"protocol"` // tcp, udp or tls
-	Timeout  time.Duration `yaml:"timeout" json:"timeout"`   // per batch, including dialing
-	CAFile   string        `yaml:"ca_file" json:"ca_file"`   // TLS PEM trust bundle; empty uses system roots
+	Address  string        `yaml:"address" json:"address"`     // host:port
+	Protocol string        `yaml:"protocol" json:"protocol"`   // tcp, udp or tls
+	Format   string        `yaml:"format" json:"format"`       // rfc3164 or rfc5424
+	Timeout  time.Duration `yaml:"timeout" json:"timeout"`     // per batch, including dialing
+	CAFile   string        `yaml:"ca_file" json:"ca_file"`     // TLS PEM trust bundle; empty uses system roots
+	CertFile string        `yaml:"cert_file" json:"cert_file"` // TLS client certificate (mutual TLS)
+	KeyFile  string        `yaml:"key_file" json:"key_file"`   // TLS client private key (mutual TLS)
 }
 
 // StateConfig is where the cursor is persisted between restarts
@@ -248,8 +257,11 @@ func applyEnvOverrides(cfg *Config) error {
 	e.string("EVENTS_OUTPUT_PATH", &cfg.Events.Output.Path)
 	e.string("EVENTS_SYSLOG_ADDRESS", &cfg.Events.Output.Syslog.Address)
 	e.string("EVENTS_SYSLOG_PROTOCOL", &cfg.Events.Output.Syslog.Protocol)
+	e.string("EVENTS_SYSLOG_FORMAT", &cfg.Events.Output.Syslog.Format)
 	e.duration("EVENTS_SYSLOG_TIMEOUT", &cfg.Events.Output.Syslog.Timeout)
 	e.string("EVENTS_SYSLOG_CA_FILE", &cfg.Events.Output.Syslog.CAFile)
+	e.string("EVENTS_SYSLOG_CERT_FILE", &cfg.Events.Output.Syslog.CertFile)
+	e.string("EVENTS_SYSLOG_KEY_FILE", &cfg.Events.Output.Syslog.KeyFile)
 	e.string("EVENTS_STATE_BACKEND", &cfg.Events.State.Backend)
 	e.string("EVENTS_STATE_PATH", &cfg.Events.State.Path)
 	e.string("EVENTS_STATE_CONFIGMAP", &cfg.Events.State.ConfigMap)
