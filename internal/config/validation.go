@@ -3,7 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -71,8 +73,23 @@ func validateEvents(ev *EventsConfig, add func(string, ...any)) {
 		if ev.Output.Path == "" {
 			add("events.output.path is required with events.output.type=file")
 		}
+	case OutputSyslog:
+		host, port, err := net.SplitHostPort(ev.Output.Syslog.Address)
+		n, portErr := strconv.Atoi(port)
+		if err != nil || host == "" || strings.ContainsAny(host, " \t\r\n") || portErr != nil || n < 1 || n > 65535 {
+			add("events.output.syslog.address must be host:port with a port between 1 and 65535")
+		}
+		if !slices.Contains([]string{"tcp", "udp", "tls"}, ev.Output.Syslog.Protocol) {
+			add("events.output.syslog.protocol must be tcp, udp or tls")
+		}
+		if ev.Output.Syslog.CAFile != "" && ev.Output.Syslog.Protocol != "tls" {
+			add("events.output.syslog.ca_file requires protocol=tls")
+		}
+		if ev.Output.Syslog.Timeout <= 0 {
+			add("events.output.syslog.timeout must be > 0")
+		}
 	default:
-		add("events.output.type must be %q or %q", OutputStdout, OutputFile)
+		add("events.output.type must be %q, %q or %q", OutputStdout, OutputFile, OutputSyslog)
 	}
 
 	switch ev.State.Backend {

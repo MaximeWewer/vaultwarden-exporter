@@ -158,6 +158,12 @@ func build(cfg *config.Config, stdout io.Writer) (*app, error) {
 		if cfg.Events.Output.Type == config.OutputFile {
 			sink = &events.File{Path: cfg.Events.Output.Path}
 		}
+		if cfg.Events.Output.Type == config.OutputSyslog {
+			sink, err = events.NewSyslog(cfg.Events.Output.Syslog)
+			if err != nil {
+				return nil, err
+			}
+		}
 		poller, err := events.NewPoller(db, cfg.Events, cfg.Database.QueryTimeout, store, sink, reg)
 		if err != nil {
 			return nil, err
